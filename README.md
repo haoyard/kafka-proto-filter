@@ -14,9 +14,9 @@
   （如 `shared_events.proto` + `common.proto`，一个定义业务事件、一个定义公共类型），
   用 `-map 'topic=消息类型'` 建立映射即可，不必按 topic 命名 proto 文件，见下文。
 - **offset 语义与 Redpanda Console 对齐**：
+  - `-offset 0` 从日志最早的可用 offset 开始（受保留策略影响，最早 offset 可能 >0，自动校正）
   - `-offset -50` 表示 newest-50（从最新位置往前 50 条开始）
   - `-offset 12345678900` 表示绝对 offset
-  - `-oldest` 从分区最早的消息开始
   - `-from-time "2026-09-20 10:00:00"` 按时间戳定位起点（也支持 Unix 秒/毫秒）
   - `-partition 4` 只看分区 4，缺省扫所有分区
 - **没有"窗口耗尽"概念**：offset/时间戳只是起点，从起点持续消费——积压扫完后接着等新消息，
@@ -188,11 +188,10 @@ kfilter -brokers broker1:9092,broker2:9092,broker3:9092 -topic ... \
 | `-brokers` | `127.0.0.1:9092` | broker 列表，逗号分隔（或环境变量 `KAFKA_BROKERS`） |
 | `-topic` | 必填 | topic 名 |
 | `-partition` | `-1` | 分区号，-1 = 全部分区 |
-| `-offset` | `-50` | 起始消费位置：≥0 绝对值；<0 相对 newest（-50 = 从 newest-50 开始） |
-| `-oldest` | false | 从日志起点开始（覆盖 `-offset` 和 `-from-time`） |
-| `-from-time` | 空 | 按时间戳定位起始位置：纯数字 Unix 秒/毫秒（≥1e12 视为毫秒），或 `2006-01-02 15:04:05`（本地时区）；时间戳晚于全部消息时从当前头部开始等新消息 |
+| `-offset` | `-50` | 起始消费位置：≥0 绝对值（**0 = 从日志最早的可用 offset 开始**，受保留策略影响可能 >0，自动校正）；<0 相对 newest（-50 = 从 newest-50 开始） |
+| `-from-time` | 空 | 按时间戳定位起始位置：纯数字 Unix 秒/毫秒（≥1e12 视为毫秒），或 `2006-01-02 15:04:05`（本地时区）；时间戳晚于全部消息时从当前头部开始等新消息。与 `-offset` 同时设置时 **`-from-time` 生效**（工具会打印提示） |
 | `-limit` | `50` | 最多输出命中条数（**上限不是目标**：offset 只是起点，没有"窗口耗尽提前返回"——未凑满会持续消费到 `-timeout`） |
-| `-timeout` | `60` | 持续消费总时长上限（秒） |
+| `-timeout` | `60` | 持续消费总时长上限（秒）；**0 = 不限时长**，一直等到命中 `-limit` 条或 Ctrl+C |
 | `-proto` | `proto` | proto 查找目录（逗号分隔多个）；配 `-map` 时为类型扫描根目录 |
 | `-proto-file` | 空 | 直接指定 proto 文件路径（优先级最高；主文件所在目录的相对 import 优先解析） |
 | `-map` | 空 | topic→消息类型映射（Redpanda serde.protobuf.mappings 等价），如 `-map 'topic=类型'` 逗号分隔多项 |

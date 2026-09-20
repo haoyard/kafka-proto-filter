@@ -55,15 +55,14 @@ var (
 	brokers     = flag.String("brokers", envOr("KAFKA_BROKERS", "127.0.0.1:9092"), "Kafka broker 地址，逗号分隔")
 	topic       = flag.String("topic", "", "目标 topic（必填）")
 	partition   = flag.Int("partition", -1, "分区号；-1 表示所有分区")
-	startOffset = flag.Int64("offset", -50, "起始消费位置：>=0 为绝对 offset；<0 相对最新（如 -50 = 从 newest-50 开始）。持续消费直到 -limit 命中或 -timeout 到期，没有终点窗口")
-	oldest      = flag.Bool("oldest", false, "从每个分区最早的消息开始（覆盖 -offset 和 -from-time）")
-	fromTime    = flag.String("from-time", "", "按时间戳定位起始消费位置（优先于 -offset，-oldest 优先级最高）：纯数字为 Unix 秒/毫秒（>=1e12 视为毫秒），或 '2006-01-02 15:04:05'（本地时区）")
+	startOffset = flag.Int64("offset", -50, "起始消费位置：>=0 为绝对 offset（0 = 从日志最早的可用 offset 开始，受保留策略影响可能 >0，自动校正）；<0 相对最新（如 -50 = 从 newest-50 开始）。持续消费直到 -limit 命中或 -timeout 到期")
+	fromTime    = flag.String("from-time", "", "按时间戳定位起始消费位置（优先于 -offset）：纯数字为 Unix 秒/毫秒（>=1e12 视为毫秒），或 '2006-01-02 15:04:05'（本地时区）")
 	maxResults  = flag.Int("limit", 50, "最多输出命中条数（上限而非目标；未凑满会持续消费到 -timeout）")
 	protoDir    = flag.String("proto", "proto", "proto 查找目录（逗号分隔），按 topic 找 <dir>/<topic>.proto；配合 -map 时为类型查找根目录")
 	protoFile   = flag.String("proto-file", "", "直接指定 proto 文件路径（优先级高于 -proto 目录中的同名文件；主文件所在目录的相对 import 优先解析）")
 	msgName     = flag.String("msg", "", "消息类型全名或短名（如 app.TraceEvent）；默认取 proto 文件里定义的第一个 message")
 	topicMap    = flag.String("map", "", "topic→消息类型映射（仿 Redpanda serde.protobuf.mappings），如 -map 'svc_order_req=OrderRequest,svc_event_push=app.TraceEvent'；设置后忽略 <topic>.proto 文件名约定，在 -proto 目录全部 .proto 文件中查找该类型")
-	timeoutSec  = flag.Int("timeout", 60, "持续消费的总时长上限（秒）")
+	timeoutSec  = flag.Int("timeout", 60, "持续消费的总时长上限（秒）；0 = 不限时长，一直等到命中 -limit 条或 Ctrl+C")
 	expr        = flag.String("expr", "", "过滤表达式（JS），空 = 全部输出")
 	verbose     = flag.Bool("v", false, "额外打印扫描进度到 stderr")
 	outFile     = flag.String("out", "", "命中结果写入 JSON Lines 文件")
@@ -394,6 +393,13 @@ func main() {
 		os.Exit(1)
 	}
 
+	// 0.4) 参数组合提示：-from-time 优先于 -offset
+	setFlags := map[string]bool{}
+	flag.Visit(func(f *flag.Flag) { setFlags[f.Name] = true })
+	if setFlags["offset"] && setFlags["from-time"] {
+		fmt.Fprintln(os.Stderr, "提示: 同时设置了 -offset 和 -from-time，以 -from-time 为准（-offset 被忽略）")
+	}
+
 	// 0.5) 时间戳起点
 	var fromTimeMs int64
 	if *fromTime != "" {
@@ -454,8 +460,6 @@ func main() {
 			}
 			var s int64
 			switch {
-			case *oldest:
-				s = first
 			case fromTimeMs > 0:
 				at, ok := afterOffs.Lookup(*topic, pid)
 				if ok && at.Offset >= 0 {
@@ -463,13 +467,14 @@ func main() {
 				} else {
 					s = hw // 时间戳晚于现有全部消息：从当前头部开始等新消息
 				}
-			case *startOffset >= 0:
+			default:
 				s = *startOffset
-			default: // 相对最新
-				s = hw + *startOffset
+				if s < 0 {
+					s += hw // 相对最新
+				}
 			}
 			if s < first {
-				fmt.Fprintf(os.Stderr, "警告: 分区 %d 请求的起点 %d 早于日志起点 %d，已调整\n", pid, s, first)
+				fmt.Fprintf(os.Stderr, "警告: 分区 %d 请求的起点 %d 早于日志最早可用 offset %d，已校正（日志保留策略可能已清理旧数据）\n", pid, s, first)
 				s = first
 			}
 			targets = append(targets, target{p: pid, start: s})
@@ -503,7 +508,10 @@ func main() {
 			cl.AddConsumePartitions(cons)
 		}
 
-		deadline := time.Now().Add(time.Duration(*timeoutSec) * time.Second)
+		var deadline time.Time // 零值 = 无超时（-timeout 0）
+		if *timeoutSec > 0 {
+			deadline = time.Now().Add(time.Duration(*timeoutSec) * time.Second)
+		}
 		var outF *os.File
 		if *outFile != "" {
 			f, err := os.Create(*outFile)
@@ -517,7 +525,6 @@ func main() {
 
 		var scanned, hits int64
 		var lastData time.Time
-		var consecErrs int // 连续客户端级错误计数
 		hintShown := false // 长时间无数据的排查提示只打一次
 
 		for hits < int64(*maxResults) {
@@ -525,7 +532,7 @@ func main() {
 				fmt.Fprintln(os.Stderr, "\n收到中断信号，提前结束")
 				break
 			}
-			if time.Now().After(deadline) {
+			if !deadline.IsZero() && time.Now().After(deadline) {
 				fmt.Fprintln(os.Stderr, "\n达到超时时间，提前结束")
 				break
 			}
@@ -537,25 +544,19 @@ func main() {
 				break
 			}
 			var fetchErr error
-			errIsFatal := false
 			fetches.EachError(func(t string, p int32, err error) {
-				// topic=="" / partition==-1 是客户端级伪错误（如轮询超时：
-				// 隧道建连慢于单次 poll 的 deadline 时 franz-go 注入），不致命
+				// topic==""/partition==-1 是 franz-go 在单次 poll 的 ctx 到期时注入的
+				// 客户端级伪错误（500ms 内无数据即触发），属正常轮询节奏而非连接问题——
+				// 真正的连接故障由"15s 无数据提示"兜底诊断；需要细看时加 -v
 				if t == "" || p < 0 {
-					if ctx.Err() == nil {
-						consecErrs++
-						if consecErrs <= 3 || consecErrs%20 == 0 {
-							fmt.Fprintf(os.Stderr, "等待 broker 连接中(%d)...: %v\n", consecErrs, err)
-						}
+					if *verbose && ctx.Err() == nil {
+						fmt.Fprintf(os.Stderr, "[v] poll 空转: %v\n", err)
 					}
 					return
 				}
 				fetchErr = err
-				errIsFatal = true
-				consecErrs = 0
 				fmt.Fprintf(os.Stderr, "消费错误 %s-%d: %v\n", t, p, err)
 			})
-			_ = errIsFatal
 			if fetchErr != nil && fetches.NumRecords() == 0 && fetchErr != context.DeadlineExceeded {
 				break
 			}
