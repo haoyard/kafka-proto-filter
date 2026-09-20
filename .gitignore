@@ -1,0 +1,17 @@
+# 二进制产物不入库（GitHub 有 100MB 限制，且无必要）
+kfilter.exe
+dist/
+*.exe
+
+# 本地真实业务 proto（schema 可能含敏感信息，只提交中性示例）
+proto/*
+!proto/my_topic.proto
+protos-local/
+
+# 命中结果输出
+*.jsonl
+
+# Go
+*.test
+*.out
+.git-commit-msg.txt

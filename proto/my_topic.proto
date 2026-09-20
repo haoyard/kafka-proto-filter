@@ -1,0 +1,25 @@
+// 示例：topic my_topic 对应的消息结构（按实际 schema 调整字段名和字段号）
+// 文件名与 topic 名一致：my_topic.proto；或运行时用 -proto-file 指定任意路径
+syntax = "proto3";
+package demo;
+
+message Item {
+  string item_id = 1;     // -> itemId
+  string channel_id = 2;  // -> channelId
+  string vendor_id = 3;   // -> vendorId
+  string vendor_pid = 4;  // -> vendorPid
+  string price_type = 5;  // -> priceType
+  double min_price = 6;   // -> minPrice
+  string req_id = 7;      // -> reqId
+  string device = 8;
+  string ua = 9;
+}
+
+message SampleMsg {
+  string item_id = 1;
+  string req_time = 2;    // -> reqTime
+  string channel_id = 3;
+  string vendor_id = 4;
+  string vendor_pid = 5;
+  repeated Item items = 6;
+}
