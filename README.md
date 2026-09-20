@@ -17,7 +17,11 @@
   - `-offset -50` 表示 newest-50（从最新位置往前 50 条开始）
   - `-offset 12345678900` 表示绝对 offset
   - `-oldest` 从分区最早的消息开始
+  - `-from-time "2026-09-20 10:00:00"` 按时间戳定位起点（也支持 Unix 秒/毫秒）
   - `-partition 4` 只看分区 4，缺省扫所有分区
+- **没有"窗口耗尽"概念**：offset/时间戳只是起点，从起点持续消费——积压扫完后接着等新消息，
+  直到命中 `-limit` 条、`-timeout` 到期或 Ctrl+C。`-limit` 是上限不是目标，
+  扫描范围内没凑满就继续等（不需要等可 Ctrl+C 或调小 `-timeout`）。
 - **过滤表达式（JS）**，两种写法等价：
   - Redpanda 风格函数体：`-expr 'if (value.vendorId === "vendor-002") { return true; } return false;'`
   - 完整函数：`-expr 'function(m){ return m.value.items[0].vendorId === "vendor-002"; }'`
@@ -57,6 +61,12 @@ kfilter ... -expr 'm.value.items.some(i => i.vendorId === "vendor-002")'
 
 # 5. 结果落盘
 kfilter ... -out hits.jsonl
+
+# 5b. 按时间戳定位起点（本地时区；也支持 Unix 秒/毫秒），从该时刻起持续消费
+#     直到命中 -limit 条或 -timeout 到期
+kfilter -brokers broker1:9092 -topic my_topic \
+  -from-time "2026-09-20 10:00:00" -limit 10 \
+  -expr 'value.vendorId === "vendor-002"'
 
 # 6. 集群开了 SASL/TLS（9093）
 kfilter -brokers broker1:9093 -tls -sasl scram-sha256 \
@@ -178,16 +188,17 @@ kfilter -brokers broker1:9092,broker2:9092,broker3:9092 -topic ... \
 | `-brokers` | `127.0.0.1:9092` | broker 列表，逗号分隔（或环境变量 `KAFKA_BROKERS`） |
 | `-topic` | 必填 | topic 名 |
 | `-partition` | `-1` | 分区号，-1 = 全部分区 |
-| `-offset` | `-50` | 起始 offset：≥0 绝对值；<0 相对 newest（-50 = newest-50） |
-| `-oldest` | false | 从日志起点开始（覆盖 `-offset`） |
-| `-limit` | `50` | 最多输出命中条数 |
+| `-offset` | `-50` | 起始消费位置：≥0 绝对值；<0 相对 newest（-50 = 从 newest-50 开始） |
+| `-oldest` | false | 从日志起点开始（覆盖 `-offset` 和 `-from-time`） |
+| `-from-time` | 空 | 按时间戳定位起始位置：纯数字 Unix 秒/毫秒（≥1e12 视为毫秒），或 `2006-01-02 15:04:05`（本地时区）；时间戳晚于全部消息时从当前头部开始等新消息 |
+| `-limit` | `50` | 最多输出命中条数（**上限不是目标**：offset 只是起点，没有"窗口耗尽提前返回"——未凑满会持续消费到 `-timeout`） |
+| `-timeout` | `60` | 持续消费总时长上限（秒） |
 | `-proto` | `proto` | proto 查找目录（逗号分隔多个）；配 `-map` 时为类型扫描根目录 |
 | `-proto-file` | 空 | 直接指定 proto 文件路径（优先级最高；主文件所在目录的相对 import 优先解析） |
 | `-map` | 空 | topic→消息类型映射（Redpanda serde.protobuf.mappings 等价），如 `-map 'topic=类型'` 逗号分隔多项 |
 | `-msg` | 第一个 message | 消息类型全名或短名（如 `app.TraceEvent`） |
 | `-expr` | 空 | JS 过滤表达式，空 = 全部输出 |
-| `-timeout` | `60` | 整体超时秒数 |
-| `-idle` | `5` | 连续无数据秒数后判定分区读完 |
+| `-timeout` | `60` | 持续消费总时长上限（秒） |
 | `-out` | 空 | JSON Lines 输出文件 |
 | `-raw` | false | value 是 JSON，不做 protobuf 解码 |
 | `-sasl` | 空 | SASL 机制：`plain` / `scram-sha256` / `scram-sha512` |

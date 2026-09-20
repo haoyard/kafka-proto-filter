@@ -55,15 +55,15 @@ var (
 	brokers     = flag.String("brokers", envOr("KAFKA_BROKERS", "127.0.0.1:9092"), "Kafka broker 地址，逗号分隔")
 	topic       = flag.String("topic", "", "目标 topic（必填）")
 	partition   = flag.Int("partition", -1, "分区号；-1 表示所有分区")
-	startOffset = flag.Int64("offset", -50, "起始 offset：>=0 为绝对 offset；<0 为相对最新位置（如 -50 = newest-50）")
-	oldest      = flag.Bool("oldest", false, "从每个分区最早的消息开始（覆盖 -offset）")
-	maxResults  = flag.Int("limit", 50, "最多输出的命中条数")
+	startOffset = flag.Int64("offset", -50, "起始消费位置：>=0 为绝对 offset；<0 相对最新（如 -50 = 从 newest-50 开始）。持续消费直到 -limit 命中或 -timeout 到期，没有终点窗口")
+	oldest      = flag.Bool("oldest", false, "从每个分区最早的消息开始（覆盖 -offset 和 -from-time）")
+	fromTime    = flag.String("from-time", "", "按时间戳定位起始消费位置（优先于 -offset，-oldest 优先级最高）：纯数字为 Unix 秒/毫秒（>=1e12 视为毫秒），或 '2006-01-02 15:04:05'（本地时区）")
+	maxResults  = flag.Int("limit", 50, "最多输出命中条数（上限而非目标；未凑满会持续消费到 -timeout）")
 	protoDir    = flag.String("proto", "proto", "proto 查找目录（逗号分隔），按 topic 找 <dir>/<topic>.proto；配合 -map 时为类型查找根目录")
 	protoFile   = flag.String("proto-file", "", "直接指定 proto 文件路径（优先级高于 -proto 目录中的同名文件；主文件所在目录的相对 import 优先解析）")
 	msgName     = flag.String("msg", "", "消息类型全名或短名（如 app.TraceEvent）；默认取 proto 文件里定义的第一个 message")
 	topicMap    = flag.String("map", "", "topic→消息类型映射（仿 Redpanda serde.protobuf.mappings），如 -map 'svc_order_req=OrderRequest,svc_event_push=app.TraceEvent'；设置后忽略 <topic>.proto 文件名约定，在 -proto 目录全部 .proto 文件中查找该类型")
-	timeoutSec  = flag.Int("timeout", 60, "整体搜索超时秒数")
-	idleSec     = flag.Int("idle", 5, "连续无数据多少秒后认为分区已读完")
+	timeoutSec  = flag.Int("timeout", 60, "持续消费的总时长上限（秒）")
 	expr        = flag.String("expr", "", "过滤表达式（JS），空 = 全部输出")
 	verbose     = flag.Bool("v", false, "额外打印扫描进度到 stderr")
 	outFile     = flag.String("out", "", "命中结果写入 JSON Lines 文件")
@@ -394,26 +394,37 @@ func main() {
 		os.Exit(1)
 	}
 
+	// 0.5) 时间戳起点
+	var fromTimeMs int64
+	if *fromTime != "" {
+		ms, perr := parseFromTime(*fromTime)
+		if perr != nil {
+			fmt.Fprintf(os.Stderr, "-from-time 解析失败: %v\n", perr)
+			os.Exit(2)
+		}
+		fromTimeMs = ms
+	}
+
 	oCtx, oCancel := context.WithTimeout(ctx, 15*time.Second)
 	startOffs, err := admin.ListStartOffsets(oCtx, *topic)
+	var afterOffs kadm.ListedOffsets
 	if err == nil {
 		endOffs, err2 := admin.ListEndOffsets(oCtx, *topic)
 		if err2 != nil {
 			err = err2
 		}
+		if err == nil && fromTimeMs > 0 {
+			afterOffs, err = admin.ListOffsetsAfterMilli(oCtx, fromTimeMs, *topic)
+		}
 		oCancel()
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "获取分区 offset 范围失败: %v\n", err)
+			fmt.Fprintf(os.Stderr, "获取分区 offset 失败: %v\n", err)
 			os.Exit(1)
 		}
 
 		type target struct {
-			p          int32
-			start, end int64 // 消息区间 [start, end)
-			first, hw  int64
-			lastSeen   int64
-			gotAny     bool
-			drained    bool
+			p     int32
+			start int64
 		}
 		var targets []target
 		// 收集分区号
@@ -445,56 +456,54 @@ func main() {
 			switch {
 			case *oldest:
 				s = first
+			case fromTimeMs > 0:
+				at, ok := afterOffs.Lookup(*topic, pid)
+				if ok && at.Offset >= 0 {
+					s = at.Offset
+				} else {
+					s = hw // 时间戳晚于现有全部消息：从当前头部开始等新消息
+				}
 			case *startOffset >= 0:
 				s = *startOffset
 			default: // 相对最新
 				s = hw + *startOffset
 			}
 			if s < first {
-				if *startOffset >= 0 {
-					fmt.Fprintf(os.Stderr, "警告: 分区 %d 请求的 offset %d 早于日志起点 %d，已调整\n", pid, *startOffset, first)
-				}
+				fmt.Fprintf(os.Stderr, "警告: 分区 %d 请求的起点 %d 早于日志起点 %d，已调整\n", pid, s, first)
 				s = first
 			}
-			if s > hw {
-				s = hw
-			}
-			tg := target{p: pid, start: s, end: hw, first: first, hw: hw, lastSeen: s - 1}
-			if s >= hw {
-				tg.drained = true // 空区间
-			}
-			targets = append(targets, tg)
+			targets = append(targets, target{p: pid, start: s})
 		}
 
 		// 打印计划
 		var b strings.Builder
-		fmt.Fprintf(&b, "topic=%s 分区=[", *topic)
+		fmt.Fprintf(&b, "topic=%s 起始=[", *topic)
 		for i, tg := range targets {
 			if i > 0 {
 				b.WriteString(",")
 			}
-			fmt.Fprintf(&b, "%d:%d..%d", tg.p, tg.start, tg.end)
+			fmt.Fprintf(&b, "%d:%d", tg.p, tg.start)
 		}
 		fmt.Fprintf(&b, "] limit=%d", *maxResults)
+		if fromTimeMs > 0 {
+			fmt.Fprintf(&b, " from-time=%d(ms)", fromTimeMs)
+		}
 		if *expr != "" {
 			fmt.Fprintf(&b, " expr=%q", *expr)
 		}
 		fmt.Println(b.String())
 
-		// 4) 订阅并消费
+		// 4) 订阅并消费（从起点持续消费：积压扫完后接着等新消息，直到 -limit/-timeout）
 		cons := map[string]map[int32]kgo.Offset{}
 		cons[*topic] = map[int32]kgo.Offset{}
 		for _, tg := range targets {
-			if !tg.drained {
-				cons[*topic][tg.p] = kgo.NewOffset().At(tg.start)
-			}
+			cons[*topic][tg.p] = kgo.NewOffset().At(tg.start)
 		}
 		if len(cons[*topic]) > 0 {
 			cl.AddConsumePartitions(cons)
 		}
 
 		deadline := time.Now().Add(time.Duration(*timeoutSec) * time.Second)
-		idleLimit := time.Duration(*idleSec) * time.Second
 		var outF *os.File
 		if *outFile != "" {
 			f, err := os.Create(*outFile)
@@ -508,9 +517,8 @@ func main() {
 
 		var scanned, hits int64
 		var lastData time.Time
-		idleMarked := false
-		var consecErrs int   // 连续分区级错误计数
-		hintShown := false   // 长时间无数据的排查提示只打一次
+		var consecErrs int // 连续客户端级错误计数
+		hintShown := false // 长时间无数据的排查提示只打一次
 
 		for hits < int64(*maxResults) {
 			if ctx.Err() != nil {
@@ -519,17 +527,6 @@ func main() {
 			}
 			if time.Now().After(deadline) {
 				fmt.Fprintln(os.Stderr, "\n达到超时时间，提前结束")
-				break
-			}
-			// 全部读完则退出
-			allDrained := true
-			for i := range targets {
-				if !targets[i].drained {
-					allDrained = false
-					break
-				}
-			}
-			if allDrained {
 				break
 			}
 
@@ -565,21 +562,11 @@ func main() {
 			n := fetches.NumRecords()
 			if n > 0 {
 				lastData = time.Now()
-				idleMarked = false
 			}
 			fetches.EachRecord(func(r *kgo.Record) {
-				// 找到对应 target
 				for i := range targets {
-					tg := &targets[i]
-					if tg.p != r.Partition {
+					if targets[i].p != r.Partition {
 						continue
-					}
-					tg.gotAny = true
-					if r.Offset > tg.lastSeen {
-						tg.lastSeen = r.Offset
-					}
-					if r.Offset >= tg.end-1 {
-						tg.drained = true
 					}
 					scanned++
 					pass, obj := evaluate(dec, filterFn, *topic, r)
@@ -596,20 +583,6 @@ func main() {
 			})
 			if hits >= int64(*maxResults) {
 				break
-			}
-			// 空闲检测：分区没消息了但水位未到（例如 start<end 但数据被截断等）
-			if n == 0 && !lastData.IsZero() && time.Since(lastData) > idleLimit {
-				// 把已无新数据的分区标记读完
-				for i := range targets {
-					if !targets[i].drained && targets[i].lastSeen >= targets[i].end-1 {
-						targets[i].drained = true
-					}
-				}
-				if !idleMarked {
-					idleMarked = true
-				} else if time.Since(lastData) > idleLimit*3 {
-					break // 长时间无数据，放弃
-				}
 			}
 			if n == 0 && lastData.IsZero() {
 				// 从未收到任何数据：超过 15s 给一次排查提示（隧道建连慢/网络不通/认证失败等）
@@ -780,6 +753,24 @@ func parseTopicMap(spec string) (map[string]string, error) {
 		out[k] = v
 	}
 	return out, nil
+}
+
+// parseFromTime 解析 -from-time：纯数字为 Unix 秒/毫秒（>=1e12 视为毫秒，否则秒），
+// 其余按本地时区解析常见日期格式。
+func parseFromTime(v string) (int64, error) {
+	v = strings.TrimSpace(v)
+	if n, err := strconv.ParseInt(v, 10, 64); err == nil {
+		if n >= 1e12 {
+			return n, nil
+		}
+		return n * 1000, nil
+	}
+	for _, layout := range []string{"2006-01-02 15:04:05", "2006-01-02T15:04:05", "2006-01-02 15:04", "2006-01-02"} {
+		if t, err := time.ParseInLocation(layout, v, time.Local); err == nil {
+			return t.UnixMilli(), nil
+		}
+	}
+	return 0, fmt.Errorf("无法解析 %q：支持 Unix 秒/毫秒（纯数字）或 2006-01-02 15:04:05 格式", v)
 }
 
 // compileAllProtos 编译 importPaths 下所有 .proto 文件（递归），返回全部 FileDescriptor。
