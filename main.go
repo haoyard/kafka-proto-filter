@@ -47,7 +47,7 @@ import (
 	"google.golang.org/protobuf/types/dynamicpb"
 )
 
-const version = "0.1.0"
+const version = "1.0.0"
 
 // ---------- CLI 参数 ----------
 
