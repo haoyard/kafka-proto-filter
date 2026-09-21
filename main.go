@@ -47,7 +47,7 @@ import (
 	"google.golang.org/protobuf/types/dynamicpb"
 )
 
-const version = "1.0.0"
+const version = "1.0.1"
 
 // ---------- CLI 参数 ----------
 
@@ -565,6 +565,11 @@ func main() {
 				lastData = time.Now()
 			}
 			fetches.EachRecord(func(r *kgo.Record) {
+				// 批内实时检查上限：一次 poll 最多拉回 512 条，
+				// 命中数可能在一个批次内超过 -limit，到达后立即停止处理
+				if hits >= int64(*maxResults) {
+					return
+				}
 				for i := range targets {
 					if targets[i].p != r.Partition {
 						continue
